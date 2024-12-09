@@ -19,6 +19,9 @@
 #include "esp32-hal-ledc.h"
 #include "sdkconfig.h"
 #include "camera_index.h"
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Arduino_JSON.h>
 
 #if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
 #include "esp32-hal-log.h"
@@ -487,6 +490,108 @@ static esp_err_t capture_handler(httpd_req_t *req) {
   log_i("FACE: %uB %ums %s%d", (uint32_t)(jchunk.len), (uint32_t)((fr_end - fr_start) / 1000), detected ? "DETECTED " : "", face_id);
   return res;
 #endif
+}
+
+bool requestPostUploadAndClassifyImage(uint8_t* imageBuffer, const int imageBufferLength, JSONVar& responseObj) {
+  bool result = true;
+
+  HTTPClient http;
+
+  // configure traged server and url
+  String url = "http://api.danangxanh.top/api/smart-recycle-bin/upload-and-classify";
+  http.begin(url.c_str());  //HTTP
+
+  // Add headers
+  http.addHeader("Content-Type", "image/jpeg");
+  http.addHeader("Content-Disposition", "inline; filename=capture.jpg");
+  http.addHeader("Content-Length", String(imageBufferLength).c_str());
+
+  // start connection and send HTTP header
+  Serial.println("Send image with length: " + String(imageBufferLength));
+
+  int httpCode = http.POST(imageBuffer, imageBufferLength);
+
+  // httpCode will be negative on error
+  if (httpCode > 0) {
+    // // HTTP header has been send and Server response header has been handled
+    // Serial.printf("[HTTP] POST... code: %d\n", httpCode);
+
+    if (httpCode == 201) {
+      String responseJson = http.getString();
+      responseObj = JSON.parse(responseJson);
+
+      if (JSON.typeof(responseObj) == "undefined") {
+        Serial.println("[HTTP] POST: Parsing response failed!");
+        result = false;
+      }
+    } else {
+      Serial.printf("[HTTP] POST: failed, error: %s\n", http.errorToString(httpCode).c_str());
+      result = false;
+    }
+  } else {
+    Serial.printf("[HTTP] POST: failed, error: %s\n", http.errorToString(httpCode).c_str());
+    result = false;
+  }
+
+  http.end();
+
+  return result;
+}
+
+static esp_err_t capture_and_upload_handler(httpd_req_t *req) {
+  camera_fb_t *fb = NULL;
+  esp_err_t res = ESP_OK;
+
+#if CONFIG_LED_ILLUMINATOR_ENABLED
+  enable_led(true);
+  vTaskDelay(150 / portTICK_PERIOD_MS);  // The LED needs to be turned on ~150ms before the call to esp_camera_fb_get()
+  fb = esp_camera_fb_get();              // or it won't be visible in the frame. A better way to do this is needed.
+  enable_led(false);
+#else
+  fb = esp_camera_fb_get();
+#endif
+
+  if (!fb) {
+    log_e("Camera capture failed");
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+
+  // // Configure HTTP client
+  // HTTPClient http;
+  // http.begin("https://api.danangxanh.top/api/smart-recycle-bin/upload-and-classify"); // Change it
+  // http.addHeader("Content-Type", "image/jpeg");
+  // http.addHeader("Content-Disposition", "inline; filename=capture.jpg");
+  // http.addHeader("Content-Length", String(fb->len).c_str());
+  // int httpResponseCode = http.POST(fb->buf, fb->len); // Send image buffer
+
+  JSONVar responseData;
+  bool isSuccess = requestPostUploadAndClassifyImage(fb->buf, fb->len, responseData);
+
+  esp_camera_fb_return(fb);
+
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+  // Add timestamp for request
+  char ts[32];
+  snprintf(ts, 32, "%lld.%06ld", fb->timestamp.tv_sec, fb->timestamp.tv_usec);
+  httpd_resp_set_hdr(req, "X-Timestamp", (const char *)ts);
+
+  if (isSuccess) {
+    responseData["type"] = "SUCCESS";
+    String responseJson = JSON.stringify(responseData);
+    res = httpd_resp_send(req, responseJson.c_str(), responseJson.length());
+    return res;
+  } else {
+    responseData["type"] = "ERROR";
+    responseData["message"] = "Fail to send image to server";
+
+    String responseJson = JSON.stringify(responseData);
+    log_e(responseJson);
+    res = httpd_resp_send_500(req);
+    return res;
+  }
 }
 
 static esp_err_t stream_handler(httpd_req_t *req) {
@@ -1196,6 +1301,13 @@ void startCameraServer() {
 #endif
   };
 
+  httpd_uri_t capture_and_upload_uri = {
+    .uri = "/capture_and_upload",
+    .method = HTTP_GET,
+    .handler = capture_and_upload_handler,
+    .user_ctx = NULL
+  };
+
   httpd_uri_t stream_uri = {
     .uri = "/stream",
     .method = HTTP_GET,
@@ -1301,6 +1413,7 @@ void startCameraServer() {
     httpd_register_uri_handler(camera_httpd, &cmd_uri);
     httpd_register_uri_handler(camera_httpd, &status_uri);
     httpd_register_uri_handler(camera_httpd, &capture_uri);
+    httpd_register_uri_handler(camera_httpd, &capture_and_upload_uri);
     httpd_register_uri_handler(camera_httpd, &bmp_uri);
 
     httpd_register_uri_handler(camera_httpd, &xclk_uri);
